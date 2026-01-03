@@ -1,4 +1,4 @@
-# Spinal-bootcamp [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/jijingg/Spinal-bootcamp/binder)
+# Spinal-bootcamp [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/2192783562-dev/Spinal-bootcamp/main)
 
 This is SpinalHDL Tutorial, More important, it's a spinalHDL run-time environment.
 
