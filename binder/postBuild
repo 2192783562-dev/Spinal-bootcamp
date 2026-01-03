@@ -4,82 +4,136 @@ set -euo pipefail
 SCALA_VERSION=2.12.8
 ALMOND_VERSION=0.5.0
 
-echo "[postBuild] Start"
+echo "[postBuild] Start: $(date)"
+echo "[postBuild] PWD=$PWD"
+echo "[postBuild] User=$USER Home=$HOME"
 
 # -----------------------------
-# 1) Install coursier + almond
+# 0) Detect conda prefix (Binder/Jupyter often has it)
 # -----------------------------
-echo "[postBuild] Installing coursier..."
-curl -L -o coursier https://git.io/coursier-cli
+if [ -n "${CONDA_PREFIX:-}" ] && [ -d "${CONDA_PREFIX}" ]; then
+  echo "[postBuild] CONDA_PREFIX=${CONDA_PREFIX}"
+else
+  # Try common places
+  if [ -d "/srv/conda/envs/notebook" ]; then
+    export CONDA_PREFIX="/srv/conda/envs/notebook"
+  elif [ -d "/opt/conda" ]; then
+    export CONDA_PREFIX="/opt/conda"
+  fi
+  echo "[postBuild] inferred CONDA_PREFIX=${CONDA_PREFIX:-<empty>}"
+fi
+
+# Ensure our bins are on PATH for future terminals
+mkdir -p "$HOME/bin" "$HOME/.local/bin"
+if ! grep -q 'export PATH="$HOME/.local/bin:$HOME/bin:$PATH"' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'export PATH="$HOME/.local/bin:$HOME/bin:$PATH"' >> "$HOME/.bashrc"
+fi
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+# -----------------------------
+# 1) Install coursier + almond kernel
+# -----------------------------
+echo "[postBuild] Installing coursier + almond..."
+curl -Lo coursier https://git.io/coursier-cli
 chmod +x coursier
 
-echo "[postBuild] Installing almond..."
 ./coursier bootstrap \
-  -r jitpack \
-  -i user -I user:sh.almond:scala-kernel-api_${SCALA_VERSION}:${ALMOND_VERSION} \
-  sh.almond:scala-kernel_${SCALA_VERSION}:${ALMOND_VERSION} \
-  --sources --default=true \
-  -o almond
+    -r jitpack \
+    -i user -I user:sh.almond:scala-kernel-api_"$SCALA_VERSION":"$ALMOND_VERSION" \
+    sh.almond:scala-kernel_"$SCALA_VERSION":"$ALMOND_VERSION" \
+    --sources --default=true \
+    -o almond
 ./almond --install
 
 # -----------------------------
-# 2) JupyterLab extension (optional; don't fail build if it errors)
+# 2) JupyterLab extension + custom.js
 # -----------------------------
 echo "[postBuild] Installing JupyterLab extensions..."
+# In newer JupyterLab, labextension install can fail; don't hard-fail Binder build
 jupyter labextension install @jupyterlab/plotly-extension || true
 
-# -----------------------------
-# 3) custom.js (optional)
-# -----------------------------
-echo "[postBuild] Installing custom Javascript..."
+echo "[postBuild] Installing custom.js..."
 mkdir -p ~/.jupyter/custom
-cp -f source/custom.js ~/.jupyter/custom/custom.js || true
+if [ -f "source/custom.js" ]; then
+  cp source/custom.js ~/.jupyter/custom/custom.js
+fi
 
 # -----------------------------
-# 4) Verilator wrapper: fix C++ standard & drop bad flags
-#    - Some SpinalSim flows pass -CFLAGS -std=c++11 (breaks Verilator >=5)
-#    - Some environments pass -CXXFLAGS which Verilator rejects
-#    - We force -std=gnu++17 at the end
+# 3) Create a robust verilator wrapper
+#    - avoids hard-coded paths
+#    - drops -std=c++11 from args
+#    - forces -std=gnu++17
+#    - maps -CXXFLAGS -> -CFLAGS if seen
 # -----------------------------
 echo "[postBuild] Installing verilator wrapper..."
-mkdir -p "$HOME/bin"
-
 cat > "$HOME/bin/verilator" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-REAL="/srv/conda/envs/notebook/bin/verilator"
-LOG="/tmp/verilator_wrapper.log"
+SELF="$(readlink -f "$0" || echo "$0")"
 
-# Log invocation
+# Locate real verilator
+REAL=""
+
+candidates=()
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  candidates+=("${CONDA_PREFIX}/bin/verilator")
+fi
+candidates+=(
+  "/srv/conda/envs/notebook/bin/verilator"
+  "/opt/conda/bin/verilator"
+  "/usr/local/bin/verilator"
+  "/usr/bin/verilator"
+)
+
+for c in "${candidates[@]}"; do
+  if [ -x "$c" ]; then
+    r="$(readlink -f "$c" || echo "$c")"
+    if [ "$r" != "$SELF" ]; then
+      REAL="$r"
+      break
+    fi
+  fi
+done
+
+if [ -z "$REAL" ]; then
+  # Search PATH excluding $HOME/bin to avoid recursion
+  PATH2="$(echo "$PATH" | awk -v RS=: -v ORS=: '$0!="'$HOME'/bin"{print}' | sed 's/:$//')"
+  REAL="$(PATH="$PATH2" command -v verilator || true)"
+fi
+
+if [ -z "${REAL:-}" ] || [ ! -x "$REAL" ]; then
+  echo "[verilator-wrapper] ERROR: cannot find real verilator binary" >&2
+  exit 127
+fi
+
+LOG="/tmp/verilator_wrapper.log"
 {
   echo "=== wrapper called at $(date) ==="
   echo "PWD=$(pwd)"
-  echo -n "ARGV:"
+  echo -n "REAL=$REAL ARGV:"
   printf " %q" "$@"
   echo
 } >> "$LOG"
 
 out=()
-i=1
-argc=$#
+i=0
+while [ $i -lt $# ]; do
+  a="${!((i+1))}"
 
-while [ $i -le $argc ]; do
-  a="${!i}"
-
-  # Map -CXXFLAGS -> -CFLAGS (Verilator doesn't accept -CXXFLAGS)
+  # Some flows pass -CXXFLAGS; verilator expects -CFLAGS
   if [ "$a" = "-CXXFLAGS" ]; then
     out+=("-CFLAGS")
     i=$((i+1))
     continue
   fi
 
-  # Drop problematic -std=c++11 / -std=gnu++11 etc that break Verilator headers
+  # Drop old standard flags after -CFLAGS/-LDFLAGS
   if [ "$a" = "-CFLAGS" ] || [ "$a" = "-LDFLAGS" ]; then
     out+=("$a")
     i=$((i+1))
-    if [ $i -le $argc ]; then
-      v="${!i}"
+    if [ $i -lt $# ]; then
+      v="${!((i+1))}"
       case "$v" in
         -std=c++11|-std=gnu++11|-std=c++0x|-std=gnu++0x)
           echo "DROP(after $a): $v" >> "$LOG"
@@ -87,93 +141,180 @@ while [ $i -le $argc ]; do
           continue
           ;;
       esac
-      out+=("$v")
-      i=$((i+1))
-      continue
     fi
     continue
   fi
 
-  # Keep everything else
   out+=("$a")
   i=$((i+1))
 done
 
-# Force a modern standard at the end (wins over earlier flags)
+# Force modern C++ standard
 out+=("-CFLAGS" "-std=gnu++17")
 
 echo "EXEC: $REAL ${out[*]}" >> "$LOG"
 exec "$REAL" "${out[@]}"
 EOF
-
 chmod +x "$HOME/bin/verilator"
-echo "[postBuild] verilator wrapper installed at $HOME/bin/verilator"
 
-# Ensure wrapper is used in PATH for interactive terminals + subprocesses
-# (postBuild runs non-interactively; we'll write a profile snippet)
-mkdir -p "$HOME/.bashrc.d"
-cat > "$HOME/.bashrc.d/10-binder-path.sh" <<'EOF'
-export PATH="$HOME/bin:$PATH"
-EOF
+# -----------------------------
+# 4) Generate spinal_env.sh (auto add JNI include paths)
+#    This addresses: fatal error: jni.h: No such file or directory
+# -----------------------------
+echo "[postBuild] Generating spinal_env.sh for JNI include..."
+cat > "$HOME/.local/bin/spinal_env.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Also add to .bashrc if the environment doesn't source .bashrc.d
-if ! grep -q 'binder-path' "$HOME/.bashrc" 2>/dev/null; then
-  {
-    echo ""
-    echo "# binder-path"
-    echo 'export PATH="$HOME/bin:$PATH"'
-  } >> "$HOME/.bashrc"
+# Derive JAVA_HOME if not set
+if [ -z "${JAVA_HOME:-}" ]; then
+  if command -v javac >/dev/null 2>&1; then
+    javac_path="$(readlink -f "$(command -v javac)" || true)"
+    # .../bin/javac -> JAVA_HOME = .../
+    if [ -n "$javac_path" ]; then
+      export JAVA_HOME="$(dirname "$(dirname "$javac_path")")"
+    fi
+  fi
 fi
 
-# -----------------------------
-# 5) Provide a stable test runner command (no chmod issues, no repo file needed)
-# -----------------------------
-echo "[postBuild] Installing run_spinal_test helper..."
-mkdir -p "$HOME/.local/bin"
+# Add JNI include paths if available
+if [ -n "${JAVA_HOME:-}" ] && [ -d "${JAVA_HOME}/include" ]; then
+  inc="${JAVA_HOME}/include"
+  inc_os=""
+  # Linux is typical on Binder
+  if [ -d "${JAVA_HOME}/include/linux" ]; then
+    inc_os="${JAVA_HOME}/include/linux"
+  elif [ -d "${JAVA_HOME}/include/darwin" ]; then
+    inc_os="${JAVA_HOME}/include/darwin"
+  fi
 
+  # Append (do not overwrite) include flags
+  export CPPFLAGS="${CPPFLAGS:-}"
+  export CXXFLAGS="${CXXFLAGS:-}"
+
+  if [[ "${CPPFLAGS}" != *"-I${inc}"* ]]; then
+    export CPPFLAGS="${CPPFLAGS} -I${inc}"
+  fi
+  if [ -n "$inc_os" ] && [[ "${CPPFLAGS}" != *"-I${inc_os}"* ]]; then
+    export CPPFLAGS="${CPPFLAGS} -I${inc_os}"
+  fi
+
+  # Some build systems use CXXFLAGS for include too
+  if [[ "${CXXFLAGS}" != *"-I${inc}"* ]]; then
+    export CXXFLAGS="${CXXFLAGS} -I${inc}"
+  fi
+  if [ -n "$inc_os" ] && [[ "${CXXFLAGS}" != *"-I${inc_os}"* ]]; then
+    export CXXFLAGS="${CXXFLAGS} -I${inc_os}"
+  fi
+fi
+EOF
+chmod +x "$HOME/.local/bin/spinal_env.sh"
+
+# -----------------------------
+# 5) Install run_spinal_test (auto-find mill, auto-clean, auto-source spinal_env.sh)
+# -----------------------------
+echo "[postBuild] Installing run_spinal_test..."
 cat > "$HOME/.local/bin/run_spinal_test" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-TEST="${1:-}"
-if [[ -z "$TEST" ]]; then
-  echo "Usage: run_spinal_test <TestClassName>"
-  echo "Example: run_spinal_test ApbArbiterTest"
+if [ $# -lt 1 ]; then
+  echo "Usage: run_spinal_test <TestClassName> [--clean]" >&2
   exit 2
 fi
 
-# Prefer working in ~/exercises if present
-if [[ -d "$HOME/exercises" ]]; then
-  cd "$HOME/exercises"
-else
-  echo "[run_spinal_test] ERROR: ~/exercises not found"
-  exit 1
+TEST="$1"
+CLEAN="${2:-}"
+
+# Always ensure wrappers/env are available
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+# Add JNI include flags if possible
+if [ -x "$HOME/.local/bin/spinal_env.sh" ]; then
+  # shellcheck disable=SC1090
+  source "$HOME/.local/bin/spinal_env.sh"
 fi
 
-# Clean stale artifacts (this is what made it succeed for you)
-rm -rf simWorkspace out || true
+# Find repo root (directory containing exercises/)
+find_root() {
+  local d="$PWD"
+  while [ "$d" != "/" ]; do
+    if [ -d "$d/exercises" ]; then
+      echo "$d"; return 0
+    fi
+    d="$(dirname "$d")"
+  done
+  return 1
+}
 
-# Force toolchain
-export CC=gcc
-export CXX=g++
-export CXXFLAGS="-O2 -std=gnu++17"
-export CPPFLAGS=""
+ROOT="$(find_root || true)"
+if [ -z "$ROOT" ]; then
+  if [ -d "$HOME/exercises" ]; then
+    ROOT="$HOME"
+  else
+    echo "[run_spinal_test] ERROR: cannot locate repo root (no exercises/ found)" >&2
+    exit 1
+  fi
+fi
 
-# Ensure our wrapper is first
-export PATH="$HOME/bin:$PATH"
+EX="$ROOT/exercises"
+MILL="$ROOT/mill"
 
-echo "[run_spinal_test] Using verilator: $(command -v verilator)"
-verilator --version || true
-echo "[run_spinal_test] Running mill test: exercises.${TEST}"
+ensure_mill() {
+  if [ -x "$MILL" ]; then return 0; fi
+  if [ -f "$MILL" ]; then chmod +x "$MILL" && return 0; fi
 
-../mill -i Examples.test.testOnly "exercises.${TEST}"
+  # If run.sh exists, run it once (some repos bootstrap mill/ivy here)
+  if [ -f "$EX/run.sh" ]; then
+    echo "[run_spinal_test] mill missing -> running $EX/run.sh to bootstrap"
+    (cd "$EX" && bash ./run.sh) || true
+  elif [ -f "$ROOT/run.sh" ]; then
+    echo "[run_spinal_test] mill missing -> running $ROOT/run.sh to bootstrap"
+    (cd "$ROOT" && bash ./run.sh) || true
+  fi
+
+  if [ -f "$MILL" ]; then
+    chmod +x "$MILL" || true
+  fi
+  if [ -x "$MILL" ]; then return 0; fi
+
+  # Final fallback: download mill launcher based on .mill-version
+  local V="0.11.12"
+  if [ -f "$ROOT/.mill-version" ]; then
+    V="$(tr -d ' \t\r\n' < "$ROOT/.mill-version")"
+  fi
+  echo "[run_spinal_test] mill still missing -> downloading mill $V to $MILL"
+  curl -L -o "$MILL" "https://github.com/com-lihaoyi/mill/releases/download/${V}/${V}"
+  chmod +x "$MILL"
+}
+
+ensure_mill
+
+echo "[run_spinal_test] Repo root : $ROOT"
+echo "[run_spinal_test] Using mill : $MILL"
+echo "[run_spinal_test] Using verilator: $(command -v verilator || true)"
+echo "[run_spinal_test] JAVA_HOME=${JAVA_HOME:-<unset>}"
+echo "[run_spinal_test] CPPFLAGS=${CPPFLAGS:-<unset>}"
+echo "[run_spinal_test] CXXFLAGS=${CXXFLAGS:-<unset>}"
+echo "[run_spinal_test] Running: exercises.${TEST}"
+
+cd "$EX"
+
+if [ "$CLEAN" = "--clean" ]; then
+  echo "[run_spinal_test] Cleaning simWorkspace + out"
+  rm -rf simWorkspace out || true
+fi
+
+"$MILL" -i Examples.test.testOnly "exercises.${TEST}"
 EOF
-
 chmod +x "$HOME/.local/bin/run_spinal_test"
 
-# Ensure ~/.local/bin is in PATH too
-if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-fi
+# -----------------------------
+# 6) Convenience: print versions (non-fatal)
+# -----------------------------
+echo "[postBuild] Versions:"
+( command -v verilator >/dev/null 2>&1 && verilator --version ) || true
+( command -v g++ >/dev/null 2>&1 && g++ --version | head -n 2 ) || true
+( command -v java >/dev/null 2>&1 && java -version ) || true
 
-echo "[postBuild] Done"
+echo "[postBuild] Done: $(date)"
