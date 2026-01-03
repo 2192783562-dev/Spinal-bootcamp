@@ -1,29 +1,47 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-SCALA_VERSION=2.12.8 ALMOND_VERSION=0.5.0
+SCALA_VERSION=2.12.8
+ALMOND_VERSION=0.5.0
 
-# Install coursier
-curl -Lo coursier https://git.io/coursier-cli
+echo "[postBuild] Start"
+
+# -----------------------------
+# 1) Install coursier + almond
+# -----------------------------
+echo "[postBuild] Installing coursier..."
+curl -L -o coursier https://git.io/coursier-cli
 chmod +x coursier
 
-# Install almond
+echo "[postBuild] Installing almond..."
 ./coursier bootstrap \
-    -r jitpack \
-    -i user -I user:sh.almond:scala-kernel-api_$SCALA_VERSION:$ALMOND_VERSION \
-    sh.almond:scala-kernel_$SCALA_VERSION:$ALMOND_VERSION \
-    --sources --default=true \
-    -o almond
+  -r jitpack \
+  -i user -I user:sh.almond:scala-kernel-api_${SCALA_VERSION}:${ALMOND_VERSION} \
+  sh.almond:scala-kernel_${SCALA_VERSION}:${ALMOND_VERSION} \
+  --sources --default=true \
+  -o almond
 ./almond --install
 
-# Install required Jupyter/JupyterLab extensions
-jupyter labextension install @jupyterlab/plotly-extension
+# -----------------------------
+# 2) JupyterLab extension (optional; don't fail build if it errors)
+# -----------------------------
+echo "[postBuild] Installing JupyterLab extensions..."
+jupyter labextension install @jupyterlab/plotly-extension || true
 
-# Install custom Javascript for solutions
+# -----------------------------
+# 3) custom.js (optional)
+# -----------------------------
+echo "[postBuild] Installing custom Javascript..."
 mkdir -p ~/.jupyter/custom
-cp source/custom.js ~/.jupyter/custom/custom.js
+cp -f source/custom.js ~/.jupyter/custom/custom.js || true
+
 # -----------------------------
-# Fix Verilator C++ standard issues for SpinalSim on Binder
+# 4) Verilator wrapper: fix C++ standard & drop bad flags
+#    - Some SpinalSim flows pass -CFLAGS -std=c++11 (breaks Verilator >=5)
+#    - Some environments pass -CXXFLAGS which Verilator rejects
+#    - We force -std=gnu++17 at the end
 # -----------------------------
+echo "[postBuild] Installing verilator wrapper..."
 mkdir -p "$HOME/bin"
 
 cat > "$HOME/bin/verilator" <<'EOF'
@@ -33,6 +51,7 @@ set -euo pipefail
 REAL="/srv/conda/envs/notebook/bin/verilator"
 LOG="/tmp/verilator_wrapper.log"
 
+# Log invocation
 {
   echo "=== wrapper called at $(date) ==="
   echo "PWD=$(pwd)"
@@ -42,23 +61,25 @@ LOG="/tmp/verilator_wrapper.log"
 } >> "$LOG"
 
 out=()
-i=0
-while [ $i -lt $# ]; do
-  a="${!((i+1))}"
+i=1
+argc=$#
 
-  # Verilator doesn't accept -CXXFLAGS, but some flows pass it
+while [ $i -le $argc ]; do
+  a="${!i}"
+
+  # Map -CXXFLAGS -> -CFLAGS (Verilator doesn't accept -CXXFLAGS)
   if [ "$a" = "-CXXFLAGS" ]; then
     out+=("-CFLAGS")
     i=$((i+1))
     continue
   fi
 
-  # Drop old std flags that break Verilator headers
+  # Drop problematic -std=c++11 / -std=gnu++11 etc that break Verilator headers
   if [ "$a" = "-CFLAGS" ] || [ "$a" = "-LDFLAGS" ]; then
     out+=("$a")
     i=$((i+1))
-    if [ $i -lt $# ]; then
-      v="${!((i+1))}"
+    if [ $i -le $argc ]; then
+      v="${!i}"
       case "$v" in
         -std=c++11|-std=gnu++11|-std=c++0x|-std=gnu++0x)
           echo "DROP(after $a): $v" >> "$LOG"
@@ -66,15 +87,19 @@ while [ $i -lt $# ]; do
           continue
           ;;
       esac
+      out+=("$v")
+      i=$((i+1))
+      continue
     fi
     continue
   fi
 
+  # Keep everything else
   out+=("$a")
   i=$((i+1))
 done
 
-# Force modern standard
+# Force a modern standard at the end (wins over earlier flags)
 out+=("-CFLAGS" "-std=gnu++17")
 
 echo "EXEC: $REAL ${out[*]}" >> "$LOG"
@@ -82,11 +107,73 @@ exec "$REAL" "${out[@]}"
 EOF
 
 chmod +x "$HOME/bin/verilator"
+echo "[postBuild] verilator wrapper installed at $HOME/bin/verilator"
 
-echo "[postBuild] Installed verilator wrapper at $HOME/bin/verilator"
+# Ensure wrapper is used in PATH for interactive terminals + subprocesses
+# (postBuild runs non-interactively; we'll write a profile snippet)
+mkdir -p "$HOME/.bashrc.d"
+cat > "$HOME/.bashrc.d/10-binder-path.sh" <<'EOF'
+export PATH="$HOME/bin:$PATH"
+EOF
 
-# Optional: if you keep run_test.sh in repo, make it executable for ./run_test.sh
-# (If you always run 'bash run_test.sh ...', you can omit this)
-if [ -f "$HOME/exercises/run_test.sh" ]; then
-  chmod +x "$HOME/exercises/run_test.sh" || true
+# Also add to .bashrc if the environment doesn't source .bashrc.d
+if ! grep -q 'binder-path' "$HOME/.bashrc" 2>/dev/null; then
+  {
+    echo ""
+    echo "# binder-path"
+    echo 'export PATH="$HOME/bin:$PATH"'
+  } >> "$HOME/.bashrc"
 fi
+
+# -----------------------------
+# 5) Provide a stable test runner command (no chmod issues, no repo file needed)
+# -----------------------------
+echo "[postBuild] Installing run_spinal_test helper..."
+mkdir -p "$HOME/.local/bin"
+
+cat > "$HOME/.local/bin/run_spinal_test" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TEST="${1:-}"
+if [[ -z "$TEST" ]]; then
+  echo "Usage: run_spinal_test <TestClassName>"
+  echo "Example: run_spinal_test ApbArbiterTest"
+  exit 2
+fi
+
+# Prefer working in ~/exercises if present
+if [[ -d "$HOME/exercises" ]]; then
+  cd "$HOME/exercises"
+else
+  echo "[run_spinal_test] ERROR: ~/exercises not found"
+  exit 1
+fi
+
+# Clean stale artifacts (this is what made it succeed for you)
+rm -rf simWorkspace out || true
+
+# Force toolchain
+export CC=gcc
+export CXX=g++
+export CXXFLAGS="-O2 -std=gnu++17"
+export CPPFLAGS=""
+
+# Ensure our wrapper is first
+export PATH="$HOME/bin:$PATH"
+
+echo "[run_spinal_test] Using verilator: $(command -v verilator)"
+verilator --version || true
+echo "[run_spinal_test] Running mill test: exercises.${TEST}"
+
+../mill -i Examples.test.testOnly "exercises.${TEST}"
+EOF
+
+chmod +x "$HOME/.local/bin/run_spinal_test"
+
+# Ensure ~/.local/bin is in PATH too
+if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+fi
+
+echo "[postBuild] Done"
