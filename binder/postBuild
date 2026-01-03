@@ -21,3 +21,72 @@ jupyter labextension install @jupyterlab/plotly-extension
 # Install custom Javascript for solutions
 mkdir -p ~/.jupyter/custom
 cp source/custom.js ~/.jupyter/custom/custom.js
+# -----------------------------
+# Fix Verilator C++ standard issues for SpinalSim on Binder
+# -----------------------------
+mkdir -p "$HOME/bin"
+
+cat > "$HOME/bin/verilator" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL="/srv/conda/envs/notebook/bin/verilator"
+LOG="/tmp/verilator_wrapper.log"
+
+{
+  echo "=== wrapper called at $(date) ==="
+  echo "PWD=$(pwd)"
+  echo -n "ARGV:"
+  printf " %q" "$@"
+  echo
+} >> "$LOG"
+
+out=()
+i=0
+while [ $i -lt $# ]; do
+  a="${!((i+1))}"
+
+  # Verilator doesn't accept -CXXFLAGS, but some flows pass it
+  if [ "$a" = "-CXXFLAGS" ]; then
+    out+=("-CFLAGS")
+    i=$((i+1))
+    continue
+  fi
+
+  # Drop old std flags that break Verilator headers
+  if [ "$a" = "-CFLAGS" ] || [ "$a" = "-LDFLAGS" ]; then
+    out+=("$a")
+    i=$((i+1))
+    if [ $i -lt $# ]; then
+      v="${!((i+1))}"
+      case "$v" in
+        -std=c++11|-std=gnu++11|-std=c++0x|-std=gnu++0x)
+          echo "DROP(after $a): $v" >> "$LOG"
+          i=$((i+1))
+          continue
+          ;;
+      esac
+    fi
+    continue
+  fi
+
+  out+=("$a")
+  i=$((i+1))
+done
+
+# Force modern standard
+out+=("-CFLAGS" "-std=gnu++17")
+
+echo "EXEC: $REAL ${out[*]}" >> "$LOG"
+exec "$REAL" "${out[@]}"
+EOF
+
+chmod +x "$HOME/bin/verilator"
+
+echo "[postBuild] Installed verilator wrapper at $HOME/bin/verilator"
+
+# Optional: if you keep run_test.sh in repo, make it executable for ./run_test.sh
+# (If you always run 'bash run_test.sh ...', you can omit this)
+if [ -f "$HOME/exercises/run_test.sh" ]; then
+  chmod +x "$HOME/exercises/run_test.sh" || true
+fi
